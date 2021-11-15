@@ -1,0 +1,14 @@
+[package]
+name = "executor"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lazy_static = { version = "1.4", features = ["spin_no_std"] }
+unicycle = { git = "https://github.com/pleasewhy/unicycle", rev = "904f1c061d4784a5642e092d308cf523a9270c6e" , default-features = false}
+bit-iter = "0.1.3"
+spin = "0.9"
+woke = "0.0.2"
+log = "0.4"
