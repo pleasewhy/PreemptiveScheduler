@@ -23,13 +23,14 @@ pub struct Executor<F: Future<Output = ()> + Unpin> {
     priority_inner: Arc<PriorityInner<F>>,
     stack_base: usize,
     pub context: ExecuterContext,
+    is_running_future: bool,
 }
 
 const STACK_SIZE: usize = 4096;
 impl<F: Future<Output = ()> + Unpin> Executor<F> {
     pub fn new(priority_inner: Arc<PriorityInner<F>>) -> Pin<Box<Self>> {
         unsafe {
-            let layout = Layout::new::<[u8; 4096]>();
+            let layout = Layout::new::<[u8; STACK_SIZE]>();
 
             let stack_base: NonNull<u8> =
                 Global.allocate(layout).expect("Alloction Failed.").cast();
@@ -38,6 +39,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 priority_inner: priority_inner,
                 stack_base: stack_base,
                 context: ExecuterContext::default(),
+                is_running_future: false,
             }));
 
             // 将executor的入口地址设置为executor_entry.asm::executor_entry
@@ -62,7 +64,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         loop {
             let mut found = false;
             for priority in 0..16 {
@@ -86,7 +88,11 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                                 unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut _ };
                             let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
                             drop(inner); // 本次运行的coroutine可能会用到GLOBAL_EXCUTOR.inner(e.g. spawn())
+
+                            self.is_running_future = true;
                             let ret = { Future::poll(pinned_ref, &mut cx) };
+                            self.is_running_future = false;
+
                             inner = self.priority_inner.get_mut_inner(priority);
                             match ret {
                                 Poll::Ready(()) => inner.pages[page_idx].mark_dropped(subpage_idx),
@@ -102,6 +108,13 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 }
             }
         }
+    }
+
+    // 当前是否在运行future
+    // 发生supervisor时钟中断时, 若executor在运行future, 则
+    // 说明该future超时, 需要切换到另一个executor来执行其他future.
+    pub fn is_running_future(&self) -> bool {
+        return self.is_running_future;
     }
 }
 

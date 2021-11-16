@@ -2,7 +2,6 @@
 #![feature(allocator_api)]
 #![feature(get_mut_unchecked)]
 #![feature(global_asm)]
-#[warn(improper_ctypes)]
 
 global_asm!(include_str!("switch.S"));
 global_asm!(include_str!("executor_entry.S"));
@@ -18,4 +17,4 @@ mod runtime;
 mod executor;
 mod context;
 
-pub use runtime::{spawn, run};
+pub use runtime::{spawn, run, handle_timeout};

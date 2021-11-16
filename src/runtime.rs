@@ -5,9 +5,10 @@ use crate::waker_page::{WakerPage, WakerPageRef, WAKER_PAGE_SIZE};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use log::warn;
 use core::cell::RefCell;
+use core::ops::DerefMut;
 use lazy_static::*;
+use log::warn;
 use spin::Mutex;
 use unicycle::pin_slab::PinSlab;
 use {
@@ -133,10 +134,13 @@ pub struct ExecutorRuntime<F: Future<Output = ()> + Unpin> {
     priority_inner: Arc<PriorityInner<F>>,
 
     // 通过force_switch_future会将strong_executor降级为weak_executor
-    strong_executor: Pin<Box<Executor<F>>>,
+    strong_executor: Arc<Pin<Box<Executor<F>>>>,
 
     // 该executor在执行完一次后就会被drop
-    weak_executor: Option<Box<Executor<F>>>,
+    weak_executor_vec: Vec<Arc<Pin<Box<Executor<F>>>>>,
+
+    // runtime context
+    context: ExecutorContext,
 }
 
 impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
@@ -145,14 +149,11 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
         let priority_inner_cloned = priority_inner.clone();
         let e = ExecutorRuntime {
             priority_inner: priority_inner,
-            strong_executor: Executor::new(priority_inner_cloned),
-            weak_executor: None,
+            strong_executor: Arc::new(Executor::new(priority_inner_cloned)),
+            weak_executor_vec: vec![],
+            context: ExecutorContext::default(),
         };
         e
-    }
-
-    pub fn run(&self) {
-        self.strong_executor.run();
     }
 
     // 添加一个task，它的初始状态是notified，也就是说它可以被执行.
@@ -163,6 +164,16 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
         let (_page, _) = inner.page(key);
         key
     }
+
+    fn add_weak_executor(&mut self, weak_executor: Arc<Pin<Box<Executor<F>>>>) {
+        self.weak_executor_vec.push(weak_executor);
+    }
+
+    fn downgrade_strong_executor(&mut self) {
+        let old = self.strong_executor.clone();
+        self.add_weak_executor(old);
+        self.strong_executor = Arc::new(Executor::new(self.priority_inner.clone()));
+    }
 }
 
 // 运行executor.run()
@@ -170,7 +181,7 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
 pub(crate) fn run_executor(executor_addr: usize) {
     log::warn!("executor addr {:x}", executor_addr);
     unsafe {
-        let p = Box::from_raw(executor_addr as *mut Executor<Task>);
+        let mut p = Box::from_raw(executor_addr as *mut Executor<Task>);
         p.run();
     }
 }
@@ -178,8 +189,14 @@ pub(crate) fn run_executor(executor_addr: usize) {
 unsafe impl Send for ExecutorRuntime<Task> {}
 unsafe impl Sync for ExecutorRuntime<Task> {}
 
+// lazy_static! {
+//     pub static ref GLOBAL_RUNTIME: Mutex<RefCell<ExecutorRuntime<Task>>> =
+//         Mutex::new(RefCell::new(ExecutorRuntime::new()));
+// }
+
 lazy_static! {
-    pub static ref GLOBAL_RUNTIME: ExecutorRuntime<Task> = ExecutorRuntime::new();
+    pub static ref GLOBAL_RUNTIME: Mutex<ExecutorRuntime<Task>> =
+        Mutex::new(ExecutorRuntime::new());
 }
 
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
@@ -188,14 +205,23 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
 }
 
 pub fn run() {
-    // GLOBAL_RUNTIME.run();
     log::warn!("GLOBAL_RUNTIME.run()");
-    let cx = ExecutorContext::default();
-    unsafe {
-        crate::switch(
-            &cx as *const ExecutorContext as usize,
-            &(GLOBAL_RUNTIME.strong_executor.context) as *const _ as usize,
-        );
+    loop {
+        let runtime = GLOBAL_RUNTIME.lock();
+        let cx_ref = &runtime.context;
+        let old_ctx = cx_ref as *const ExecutorContext as usize;
+        let new_ctx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+        // 释放保护global_runtime的锁
+        drop(runtime);
+        unsafe {
+            crate::switch(old_ctx, new_ctx);
+            // 该函数返回说明当前strong_executor执行的future超时了,
+            // 需要重新创建一个executor执行后续的future, 并且将
+            // 新的executor作为strong_executor，旧的executor添
+            // 加到weak_exector中。
+        }
+        let mut runtime = GLOBAL_RUNTIME.lock();
+        runtime.downgrade_strong_executor();
     }
 }
 
@@ -209,7 +235,18 @@ pub fn priority_spawn(future: impl Future<Output = ()> + Send + 'static, priorit
         state,
         _priority: priority as u8,
     };
-    GLOBAL_RUNTIME.add_task(priority, task);
+    GLOBAL_RUNTIME.lock().add_task(priority, task);
 }
 
-pub fn force_switch_future() {}
+// 切换到runtime的context
+pub fn handle_timeout() {
+    let runtime = GLOBAL_RUNTIME.lock();
+    if !runtime.strong_executor.is_running_future() {
+        return;
+    }
+    let cx_ref = &runtime.context;
+    let old_ctx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+    let new_ctx = cx_ref as *const ExecutorContext as usize;
+    drop(runtime);
+    unsafe { crate::switch(old_ctx, new_ctx) };
+}
