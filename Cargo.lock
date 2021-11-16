@@ -9,6 +9,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7be7c2c2141ebd90bf4d8e18e216d3205bbd5cec01dd6f022c1e5f6b6b56117"
 
 [[package]]
+name = "bit_field"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcb6dd1c2376d2e096796e234a70e17e94cc2d5d54ff8ce42b28cef1d0d359a4"
+
+[[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22,6 +34,7 @@ dependencies = [
  "lazy_static",
  "log",
  "spin 0.9.2",
+ "trapframe",
  "unicycle",
  "woke",
 ]
@@ -54,6 +67,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raw-cpuid"
+version = "9.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1733f6f80c9c24268736a501cd00d41a9849b4faa7a9f9334c096e5d10553206"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -75,6 +97,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trapframe"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e78755824dd684d3d110948daf6baa83e093c78a7faee474e517d8cf6cb1e0"
+dependencies = [
+ "raw-cpuid",
+ "x86_64",
+]
+
+[[package]]
 name = "unicycle"
 version = "0.7.1"
 source = "git+https://github.com/pleasewhy/unicycle?rev=904f1c061d4784a5642e092d308cf523a9270c6e#904f1c061d4784a5642e092d308cf523a9270c6e"
@@ -88,7 +120,24 @@ version = "0.2.0"
 source = "git+https://github.com/pleasewhy/uniset?rev=40edbd7506979daa1d49f935b568873a6a21c5c0#40edbd7506979daa1d49f935b568873a6a21c5c0"
 
 [[package]]
+name = "volatile"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4c2dbd44eb8b53973357e6e207e370f0c1059990df850aca1eca8947cf464f0"
+
+[[package]]
 name = "woke"
 version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eafdab77c9ee549298ca6585107832aa89d77b14ba13cda220fec6105b17dbb1"
+
+[[package]]
+name = "x86_64"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc6ed1ed2cd4536b083c34041aff7b84448ee25ac4aa5e9d54802ce226f9815"
+dependencies = [
+ "bit_field",
+ "bitflags",
+ "volatile",
+]

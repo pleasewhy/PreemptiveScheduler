@@ -8,6 +8,7 @@ use alloc::alloc::{Allocator, Global, Layout};
 use bit_iter::BitIter;
 use core::pin::Pin;
 use core::task::Waker;
+use trapframe::TrapFrame;
 use {
     alloc::boxed::Box,
     alloc::sync::Arc,
@@ -23,6 +24,7 @@ pub struct Executor<F: Future<Output = ()> + Unpin> {
     priority_inner: Arc<PriorityInner<F>>,
     stack_base: usize,
     pub context: ExecuterContext,
+    pub trapfrmae: TrapFrame,
     is_running_future: bool,
 }
 
@@ -39,6 +41,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 priority_inner: priority_inner,
                 stack_base: stack_base,
                 context: ExecuterContext::default(),
+                trapfrmae: TrapFrame::default(),
                 is_running_future: false,
             }));
 
@@ -59,6 +62,11 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 stack_top,
                 executer_ref as *const _ as usize
             );
+
+            // 设置trapfame
+            pin_executor.trapfrmae.general.sp = stack_top;
+            pin_executor.trapfrmae.sepc = executor_entry as *const () as usize;
+
             pin_executor.context.sp = stack_top;
             pin_executor
         }
@@ -110,6 +118,25 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
         }
     }
 
+    // stack layout: [executor_addr|32个寄存器|sstatus|sepc]
+    // 发生中断时trapframe保存在栈中
+    pub fn generate_stack(executor_addr: usize, stack_top: usize) {
+        // 将executor的地址放置在栈底, 以便于新的executor执行线程获取到
+        // executor实例。
+        stack_top -= core::mem::size_of::<usize>();
+        unsafe {
+            *(stack_top as *mut usize) = executor_addr;
+        }
+
+        let executor_stack = stack_top;
+        stack_top -= core::mem::size_of::<TrapFrame>();
+        unsafe {
+            *(stack_top as *mut TrapFrame).general.sp = executor_stack;
+            *(stack_top as *mut TrapFrame).sstatus = executor_entry as *const () as usize;
+            *(stack_top as *mut TrapFrame).sepc = executor_entry as *const () as usize;
+        }
+    }
+
     // 当前是否在运行future
     // 发生supervisor时钟中断时, 若executor在运行future, 则
     // 说明该future超时, 需要切换到另一个executor来执行其他future.
@@ -117,6 +144,5 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
         return self.is_running_future;
     }
 }
-
 unsafe impl Send for Executor<Task> {}
 unsafe impl Sync for Executor<Task> {}
