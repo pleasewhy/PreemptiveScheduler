@@ -125,6 +125,7 @@ impl<F: Future<Output = ()> + Unpin> PriorityInner<F> {
     }
 
     pub fn get_mut_inner(&self, priority: usize) -> RefMut<'_, Inner<F>> {
+        log::error!("get mut inner, addr={:x}, priority={}", self as *const _ as usize, priority);
         return self.inners[priority].borrow_mut();
     }
 }
@@ -248,5 +249,6 @@ pub fn handle_timeout() {
     let old_ctx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
     let new_ctx = cx_ref as *const ExecutorContext as usize;
     drop(runtime);
+    log::warn!("switch to executor runtime");
     unsafe { crate::switch(old_ctx, new_ctx) };
 }

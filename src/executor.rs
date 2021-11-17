@@ -9,6 +9,7 @@ use bit_iter::BitIter;
 use core::pin::Pin;
 use core::task::Waker;
 use trapframe::TrapFrame;
+use riscv::register::sstatus;
 use {
     alloc::boxed::Box,
     alloc::sync::Arc,
@@ -45,34 +46,31 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 is_running_future: false,
             }));
 
-            // 将executor的入口地址设置为executor_entry.asm::executor_entry
-            pin_executor.context.ra = executor_entry as *const () as usize;
-
             // 栈是从高地址向低地址生长的
-            let mut stack_top = pin_executor.stack_base + STACK_SIZE;
+            let stack_top = pin_executor.stack_base + STACK_SIZE;
+            let executer_addr = pin_executor.as_ref().get_ref() as *const _ as usize;
 
-            // 将executor的地址放置在栈底, 以便于新的executor执行线程获取到
-            // executor实例。
-            stack_top -= core::mem::size_of::<usize>();
-            let executer_ref = pin_executor.as_ref().get_ref();
-            *(stack_top as *mut usize) = executer_ref as *const _ as usize;
+            // 发生trap时, 会将trapframe储存在stack中, 在trap_return时
+            // 会loadtrapframe恢复trap前的context. 对于新创建的executor, 
+            // 需要手动在栈上保存trapframe(主要是sepc和sstatus寄存器), 
+            // 并将sp寄存器设置为改地址.
+            pin_executor.context.sp = Self::generate_stack(executer_addr, stack_top);
+
+            // 将executor的入口地址设置为trap_return, 它会帮助我们sret到
+            // executor_entry.S::executor_entry中执行
+            pin_executor.context.ra = crate::trap_return as *const () as usize;
 
             log::warn!(
                 "stack top 0x{:x} executor addr 0x{:x}",
-                stack_top,
-                executer_ref as *const _ as usize
+                pin_executor.context.sp,
+                executer_addr
             );
-
-            // 设置trapfame
-            pin_executor.trapfrmae.general.sp = stack_top;
-            pin_executor.trapfrmae.sepc = executor_entry as *const () as usize;
-
-            pin_executor.context.sp = stack_top;
             pin_executor
         }
     }
 
     pub fn run(&mut self) {
+        log::warn!("new executor run, addr={:x}", self as *const _ as usize);
         loop {
             let mut found = false;
             for priority in 0..16 {
@@ -96,12 +94,20 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                                 unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut _ };
                             let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
                             drop(inner); // 本次运行的coroutine可能会用到GLOBAL_EXCUTOR.inner(e.g. spawn())
+                            inner = self.priority_inner.get_mut_inner(priority);
+                            drop(inner);
 
+                            unsafe { sstatus::set_sie(); } // poll future时允许中断
+                            log::warn!("enable interrupt future={}", idx);
                             self.is_running_future = true;
                             let ret = { Future::poll(pinned_ref, &mut cx) };
+                            log::warn!("disable interrupt");
+                            unsafe { sstatus::clear_sie(); } // 禁用中断
                             self.is_running_future = false;
 
+                            log::info!("get_mut_inner: priority={}", priority);
                             inner = self.priority_inner.get_mut_inner(priority);
+                            log::info!("get_mut_inner over");
                             match ret {
                                 Poll::Ready(()) => inner.pages[page_idx].mark_dropped(subpage_idx),
                                 Poll::Pending => (),
@@ -111,6 +117,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 }
             }
             if !found {
+                log::warn!("no notified future, waiting for interrupt");
                 unsafe {
                     crate::wait_for_interrupt();
                 }
@@ -120,9 +127,10 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
 
     // stack layout: [executor_addr|32个寄存器|sstatus|sepc]
     // 发生中断时trapframe保存在栈中
-    pub fn generate_stack(executor_addr: usize, stack_top: usize) {
+    pub fn generate_stack(executor_addr: usize, stack_top: usize) -> usize{
         // 将executor的地址放置在栈底, 以便于新的executor执行线程获取到
         // executor实例。
+        let mut stack_top = stack_top;
         stack_top -= core::mem::size_of::<usize>();
         unsafe {
             *(stack_top as *mut usize) = executor_addr;
@@ -131,10 +139,11 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
         let executor_stack = stack_top;
         stack_top -= core::mem::size_of::<TrapFrame>();
         unsafe {
-            *(stack_top as *mut TrapFrame).general.sp = executor_stack;
-            *(stack_top as *mut TrapFrame).sstatus = executor_entry as *const () as usize;
-            *(stack_top as *mut TrapFrame).sepc = executor_entry as *const () as usize;
+            (*(stack_top as *mut TrapFrame)).general.sp = executor_stack;
+            (*(stack_top as *mut TrapFrame)).sstatus = 1usize << 8; // 设置spp为supervisor
+            (*(stack_top as *mut TrapFrame)).sepc = executor_entry as *const () as usize;
         }
+        stack_top
     }
 
     // 当前是否在运行future

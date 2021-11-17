@@ -10,6 +10,7 @@ extern "C" {
   pub(crate) fn wait_for_interrupt();
   pub(crate) fn executor_entry();
   pub(crate) fn switch(cx1: usize, cx2: usize);
+  pub(crate) fn trap_return();
 }
 
 mod waker_page;
