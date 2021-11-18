@@ -18,4 +18,4 @@ mod runtime;
 mod executor;
 mod context;
 
-pub use runtime::{spawn, run, handle_timeout};
+pub use runtime::{spawn, run, handle_timeout, test_borrow};

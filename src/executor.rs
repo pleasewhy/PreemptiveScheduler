@@ -29,7 +29,7 @@ pub struct Executor<F: Future<Output = ()> + Unpin> {
     is_running_future: bool,
 }
 
-const STACK_SIZE: usize = 4096;
+const STACK_SIZE: usize = 4096 * 16;
 impl<F: Future<Output = ()> + Unpin> Executor<F> {
     pub fn new(priority_inner: Arc<PriorityInner<F>>) -> Pin<Box<Self>> {
         unsafe {
@@ -94,8 +94,6 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                                 unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut _ };
                             let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
                             drop(inner); // 本次运行的coroutine可能会用到GLOBAL_EXCUTOR.inner(e.g. spawn())
-                            inner = self.priority_inner.get_mut_inner(priority);
-                            drop(inner);
 
                             unsafe { sstatus::set_sie(); } // poll future时允许中断
                             log::warn!("enable interrupt future={}", idx);
@@ -105,9 +103,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                             unsafe { sstatus::clear_sie(); } // 禁用中断
                             self.is_running_future = false;
 
-                            log::info!("get_mut_inner: priority={}", priority);
                             inner = self.priority_inner.get_mut_inner(priority);
-                            log::info!("get_mut_inner over");
                             match ret {
                                 Poll::Ready(()) => inner.pages[page_idx].mark_dropped(subpage_idx),
                                 Poll::Pending => (),
@@ -117,7 +113,6 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 }
             }
             if !found {
-                log::warn!("no notified future, waiting for interrupt");
                 unsafe {
                     crate::wait_for_interrupt();
                 }

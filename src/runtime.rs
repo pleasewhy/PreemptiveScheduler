@@ -120,13 +120,11 @@ impl<F: Future<Output = ()> + Unpin> PriorityInner<F> {
     }
 
     fn priority_insert(&self, priority: usize, future: F) -> u64 {
-        log::warn!("priority insert idx={} sz={}", priority, self.inners.len());
         return self.inners[priority].borrow_mut().insert(future);
     }
 
     pub fn get_mut_inner(&self, priority: usize) -> RefMut<'_, Inner<F>> {
-        log::error!("get mut inner, addr={:x}, priority={}", self as *const _ as usize, priority);
-        return self.inners[priority].borrow_mut();
+        return self.inners[priority].try_borrow_mut().unwrap();
     }
 }
 
@@ -174,6 +172,12 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
         let old = self.strong_executor.clone();
         self.add_weak_executor(old);
         self.strong_executor = Arc::new(Executor::new(self.priority_inner.clone()));
+    }
+}
+
+impl<F: Future<Output = ()> + Unpin> Drop for ExecutorRuntime<F> {
+    fn drop(&mut self) {
+        log::error!("drop executor runtime!!!!");
     }
 }
 
@@ -251,4 +255,10 @@ pub fn handle_timeout() {
     drop(runtime);
     log::warn!("switch to executor runtime");
     unsafe { crate::switch(old_ctx, new_ctx) };
+}
+
+pub fn test_borrow() {
+    let runtime = GLOBAL_RUNTIME.lock();
+    let inner = runtime.priority_inner.get_mut_inner(DEFAULT_PRIORITY);
+    log::warn!("borrow successfully {:?}", inner.deref() as *const _ as usize);
 }
