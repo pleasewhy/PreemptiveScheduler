@@ -9,7 +9,7 @@ global_asm!(include_str!("executor_entry.S"));
 extern "C" {
   pub(crate) fn wait_for_interrupt();
   pub(crate) fn executor_entry();
-  pub(crate) fn switch(cx1: usize, cx2: usize);
+  pub(crate) fn switch(save_cx: usize, load_cx: usize);
   pub(crate) fn trap_return();
 }
 

@@ -8,8 +8,9 @@ use alloc::alloc::{Allocator, Global, Layout};
 use bit_iter::BitIter;
 use core::pin::Pin;
 use core::task::Waker;
-use trapframe::TrapFrame;
 use riscv::register::sstatus;
+use trapframe::TrapFrame;
+use core::matches;
 use {
     alloc::boxed::Box,
     alloc::sync::Arc,
@@ -21,12 +22,20 @@ use {
 use crate::executor_entry;
 use crate::runtime::PriorityInner;
 
+enum ExecutorState {
+    STRONG,
+    WEAK, // 执行完一次future后就需要被drop
+    KILLED,
+    UNUSED,
+}
+
 pub struct Executor<F: Future<Output = ()> + Unpin> {
     priority_inner: Arc<PriorityInner<F>>,
     stack_base: usize,
     pub context: ExecuterContext,
     pub trapfrmae: TrapFrame,
     is_running_future: bool,
+    state: ExecutorState,
 }
 
 const STACK_SIZE: usize = 4096 * 16;
@@ -44,6 +53,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 context: ExecuterContext::default(),
                 trapfrmae: TrapFrame::default(),
                 is_running_future: false,
+                state: ExecutorState::UNUSED,
             }));
 
             // 栈是从高地址向低地址生长的
@@ -51,8 +61,8 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
             let executer_addr = pin_executor.as_ref().get_ref() as *const _ as usize;
 
             // 发生trap时, 会将trapframe储存在stack中, 在trap_return时
-            // 会loadtrapframe恢复trap前的context. 对于新创建的executor, 
-            // 需要手动在栈上保存trapframe(主要是sepc和sstatus寄存器), 
+            // 会loadtrapframe恢复trap前的context. 对于新创建的executor,
+            // 需要手动在栈上保存trapframe(主要是sepc和sstatus寄存器),
             // 并将sp寄存器设置为改地址.
             pin_executor.context.sp = Self::generate_stack(executer_addr, stack_top);
 
@@ -95,13 +105,23 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                             let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
                             drop(inner); // 本次运行的coroutine可能会用到GLOBAL_EXCUTOR.inner(e.g. spawn())
 
-                            unsafe { sstatus::set_sie(); } // poll future时允许中断
-                            log::warn!("enable interrupt future={}", idx);
+                            unsafe {
+                                sstatus::set_sie();
+                            } // poll future时允许中断
                             self.is_running_future = true;
+
                             let ret = { Future::poll(pinned_ref, &mut cx) };
-                            log::warn!("disable interrupt");
-                            unsafe { sstatus::clear_sie(); } // 禁用中断
+
+                            unsafe {
+                                sstatus::clear_sie();
+                            } // 禁用中断
                             self.is_running_future = false;
+
+                            if let ExecutorState::WEAK = self.state {
+                                log::info!("weak executor");
+                                self.state = ExecutorState::KILLED;
+                                return;
+                            }
 
                             inner = self.priority_inner.get_mut_inner(priority);
                             match ret {
@@ -113,6 +133,8 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 }
             }
             if !found {
+                log::warn!("yield");
+                crate::runtime::yeild();
                 unsafe {
                     crate::wait_for_interrupt();
                 }
@@ -122,7 +144,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
 
     // stack layout: [executor_addr|32个寄存器|sstatus|sepc]
     // 发生中断时trapframe保存在栈中
-    pub fn generate_stack(executor_addr: usize, stack_top: usize) -> usize{
+    pub fn generate_stack(executor_addr: usize, stack_top: usize) -> usize {
         // 将executor的地址放置在栈底, 以便于新的executor执行线程获取到
         // executor实例。
         let mut stack_top = stack_top;
@@ -146,6 +168,14 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
     // 说明该future超时, 需要切换到另一个executor来执行其他future.
     pub fn is_running_future(&self) -> bool {
         return self.is_running_future;
+    }
+
+    pub fn killed(&self) -> bool {
+        return matches!(self.state, ExecutorState::KILLED);
+    }
+
+    pub fn mark_weak(&mut self) {
+        self.state = ExecutorState::WEAK;
     }
 }
 unsafe impl Send for Executor<Task> {}

@@ -1,13 +1,14 @@
 extern crate alloc;
 use crate::context::Context as ExecutorContext;
 use crate::executor::Executor;
+use crate::switch;
 use crate::waker_page::{WakerPage, WakerPageRef, WAKER_PAGE_SIZE};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::ops::DerefMut;
 use lazy_static::*;
+use riscv::register::sstatus;
 use log::warn;
 use spin::Mutex;
 use unicycle::pin_slab::PinSlab;
@@ -136,8 +137,10 @@ pub struct ExecutorRuntime<F: Future<Output = ()> + Unpin> {
     strong_executor: Arc<Pin<Box<Executor<F>>>>,
 
     // 该executor在执行完一次后就会被drop
-    weak_executor_vec: Vec<Arc<Pin<Box<Executor<F>>>>>,
+    weak_executor_vec: Vec<Option<Arc<Pin<Box<Executor<F>>>>>>,
 
+    // 当前正在执行的executor
+    current_executor: Option<Arc<Pin<Box<Executor<F>>>>>,
     // runtime context
     context: ExecutorContext,
 }
@@ -150,6 +153,7 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
             priority_inner: priority_inner,
             strong_executor: Arc::new(Executor::new(priority_inner_cloned)),
             weak_executor_vec: vec![],
+            current_executor: None,
             context: ExecutorContext::default(),
         };
         e
@@ -165,11 +169,14 @@ impl<F: Future<Output = ()> + Unpin> ExecutorRuntime<F> {
     }
 
     fn add_weak_executor(&mut self, weak_executor: Arc<Pin<Box<Executor<F>>>>) {
-        self.weak_executor_vec.push(weak_executor);
+        self.weak_executor_vec.push(Some(weak_executor));
     }
 
     fn downgrade_strong_executor(&mut self) {
-        let old = self.strong_executor.clone();
+        let mut old = self.strong_executor.clone();
+        unsafe {
+            Arc::get_mut_unchecked(&mut old).mark_weak();
+        }
         self.add_weak_executor(old);
         self.strong_executor = Arc::new(Executor::new(self.priority_inner.clone()));
     }
@@ -181,23 +188,8 @@ impl<F: Future<Output = ()> + Unpin> Drop for ExecutorRuntime<F> {
     }
 }
 
-// 运行executor.run()
-#[no_mangle]
-pub(crate) fn run_executor(executor_addr: usize) {
-    log::warn!("executor addr {:x}", executor_addr);
-    unsafe {
-        let mut p = Box::from_raw(executor_addr as *mut Executor<Task>);
-        p.run();
-    }
-}
-
 unsafe impl Send for ExecutorRuntime<Task> {}
 unsafe impl Sync for ExecutorRuntime<Task> {}
-
-// lazy_static! {
-//     pub static ref GLOBAL_RUNTIME: Mutex<RefCell<ExecutorRuntime<Task>>> =
-//         Mutex::new(RefCell::new(ExecutorRuntime::new()));
-// }
 
 lazy_static! {
     pub static ref GLOBAL_RUNTIME: Mutex<ExecutorRuntime<Task>> =
@@ -209,24 +201,63 @@ pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
     return priority_spawn(future, DEFAULT_PRIORITY);
 }
 
+//
 pub fn run() {
     log::warn!("GLOBAL_RUNTIME.run()");
     loop {
-        let runtime = GLOBAL_RUNTIME.lock();
+        let mut runtime = GLOBAL_RUNTIME.lock();
         let cx_ref = &runtime.context;
-        let old_ctx = cx_ref as *const ExecutorContext as usize;
-        let new_ctx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+        let runtime_cx = cx_ref as *const ExecutorContext as usize;
+        let executor_cx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
         // 释放保护global_runtime的锁
+        runtime.current_executor = Some(runtime.strong_executor.clone());
         drop(runtime);
         unsafe {
-            crate::switch(old_ctx, new_ctx);
+            log::warn!("run strong executor");
+            crate::switch(runtime_cx, executor_cx);
             // 该函数返回说明当前strong_executor执行的future超时了,
             // 需要重新创建一个executor执行后续的future, 并且将
             // 新的executor作为strong_executor，旧的executor添
             // 加到weak_exector中。
         }
+        log::warn!("switch return");
         let mut runtime = GLOBAL_RUNTIME.lock();
-        runtime.downgrade_strong_executor();
+        // 只有strong_executor主动yield时, 才会执行运行weak_executor;
+
+        if runtime.strong_executor.is_running_future() {
+            runtime.downgrade_strong_executor();
+            log::warn!("continued");
+            continue;
+        }
+
+        // 遍历全部的weak_executor
+        let weak_executor_num = runtime.weak_executor_vec.len();
+        log::warn!("run weak executor size={}", weak_executor_num);
+        for i in 0..weak_executor_num {
+            if runtime.weak_executor_vec[i].is_none() {
+                continue;
+            }
+            let weak_executor = runtime.weak_executor_vec[i].as_ref().unwrap();
+            if weak_executor.killed() {
+                // TODO: 回收资源
+                continue;
+            }
+            let executor_ctx = &weak_executor.context as *const ExecutorContext as usize;
+
+            runtime.current_executor = Some(weak_executor.clone());
+            drop(runtime);
+            unsafe {
+                sstatus::set_sie();
+                log::warn!("switch weak executor");
+                switch(runtime_cx, executor_ctx);
+                log::warn!("switch weak executor return");
+                sstatus::clear_sie();
+            }
+            log::warn!("global locking");
+            runtime = GLOBAL_RUNTIME.lock();
+            log::warn!("global locking finish");
+        }
+        log::warn!("run weak executor finish");
     }
 }
 
@@ -246,19 +277,48 @@ pub fn priority_spawn(future: impl Future<Output = ()> + Send + 'static, priorit
 // 切换到runtime的context
 pub fn handle_timeout() {
     let runtime = GLOBAL_RUNTIME.lock();
-    if !runtime.strong_executor.is_running_future() {
+    if !runtime.current_executor.as_ref().unwrap().is_running_future() {
         return;
     }
     let cx_ref = &runtime.context;
-    let old_ctx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
-    let new_ctx = cx_ref as *const ExecutorContext as usize;
+    let executor_cx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+    let runtime_cx = cx_ref as *const ExecutorContext as usize;
     drop(runtime);
-    log::warn!("switch to executor runtime");
-    unsafe { crate::switch(old_ctx, new_ctx) };
+    log::warn!("switching to executor runtime");
+    unsafe { crate::switch(executor_cx, runtime_cx) };
 }
 
 pub fn test_borrow() {
     let runtime = GLOBAL_RUNTIME.lock();
     let inner = runtime.priority_inner.get_mut_inner(DEFAULT_PRIORITY);
-    log::warn!("borrow successfully {:?}", inner.deref() as *const _ as usize);
+    log::warn!(
+        "borrow successfully {:?}",
+        inner.deref() as *const _ as usize
+    );
+}
+
+// 运行executor.run()
+#[no_mangle]
+pub(crate) fn run_executor(executor_addr: usize) {
+    log::warn!("executor addr {:x}", executor_addr);
+    unsafe {
+        let mut p = Box::from_raw(executor_addr as *mut Executor<Task>);
+        p.run();
+    }
+    let runtime = GLOBAL_RUNTIME.lock();
+    let cx_ref = &runtime.context;
+    let executor_cx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+    let runtime_cx = cx_ref as *const ExecutorContext as usize;
+    drop(runtime);
+    unsafe { crate::switch(executor_cx, runtime_cx) }
+    unreachable!();
+}
+
+pub(crate) fn yeild() {
+    let runtime = GLOBAL_RUNTIME.lock();
+    let cx_ref = &runtime.context;
+    let executor_cx = &(runtime.strong_executor.context) as *const ExecutorContext as usize;
+    let runtime_cx = cx_ref as *const ExecutorContext as usize;
+    drop(runtime);
+    unsafe { crate::switch(executor_cx, runtime_cx) }
 }
