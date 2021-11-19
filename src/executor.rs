@@ -80,7 +80,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
     }
 
     pub fn run(&mut self) {
-        log::warn!("new executor run, addr={:x}", self as *const _ as usize);
+        log::info!("new executor run, addr={:x}", self as *const _ as usize);
         loop {
             let mut found = false;
             for priority in 0..16 {
@@ -90,6 +90,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                         let page = &mut inner.pages[page_idx];
                         (page.take_notified(), page.take_dropped())
                     };
+                    log::trace!("notified={}", notified);
                     if notified != 0 {
                         found = true;
                         for subpage_idx in BitIter::from(notified) {
@@ -110,15 +111,16 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                             } // poll future时允许中断
                             self.is_running_future = true;
 
+                            log::trace!("polling future");
                             let ret = { Future::poll(pinned_ref, &mut cx) };
-
+                            log::trace!("polling future over");
                             unsafe {
                                 sstatus::clear_sie();
                             } // 禁用中断
                             self.is_running_future = false;
 
                             if let ExecutorState::WEAK = self.state {
-                                log::info!("weak executor");
+                                log::info!("weak executor finish poll future, need killed");
                                 self.state = ExecutorState::KILLED;
                                 return;
                             }
@@ -133,11 +135,12 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 }
             }
             if !found {
-                log::warn!("yield");
+                log::trace!("yield");
                 crate::runtime::yeild();
-                unsafe {
-                    crate::wait_for_interrupt();
-                }
+                log::trace!("yield over");
+                // unsafe {
+                //     crate::wait_for_interrupt();
+                // }
             }
         }
     }
