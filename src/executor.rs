@@ -2,15 +2,15 @@ extern crate alloc;
 extern crate log;
 
 use crate::context::Context as ExecuterContext;
-use crate::runtime::Task;
+use crate::task_collection::Task;
 use crate::waker_page::WAKER_PAGE_SIZE;
 use alloc::alloc::{Allocator, Global, Layout};
 use bit_iter::BitIter;
+use core::matches;
 use core::pin::Pin;
 use core::task::Waker;
 use riscv::register::sstatus;
 use trapframe::TrapFrame;
-use core::matches;
 use {
     alloc::boxed::Box,
     alloc::sync::Arc,
@@ -20,7 +20,7 @@ use {
 };
 
 use crate::executor_entry;
-use crate::runtime::PriorityInner;
+use crate::task_collection::TaskCollection;
 
 enum ExecutorState {
     STRONG,
@@ -29,8 +29,8 @@ enum ExecutorState {
     UNUSED,
 }
 
-pub struct Executor<F: Future<Output = ()> + Unpin> {
-    priority_inner: Arc<PriorityInner<F>>,
+pub struct Executor<F: Future<Output = ()> + Unpin + 'static> {
+    task_collection: Arc<TaskCollection<F>>,
     stack_base: usize,
     pub context: ExecuterContext,
     pub trapfrmae: TrapFrame,
@@ -39,8 +39,8 @@ pub struct Executor<F: Future<Output = ()> + Unpin> {
 }
 
 const STACK_SIZE: usize = 4096 * 16;
-impl<F: Future<Output = ()> + Unpin> Executor<F> {
-    pub fn new(priority_inner: Arc<PriorityInner<F>>) -> Pin<Box<Self>> {
+impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
+    pub fn new(task_collection: Arc<TaskCollection<F>>, cpu_id: u8) -> Pin<Box<Self>> {
         unsafe {
             let layout = Layout::new::<[u8; STACK_SIZE]>();
 
@@ -48,7 +48,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
                 Global.allocate(layout).expect("Alloction Failed.").cast();
             let stack_base = stack_base.as_ptr() as usize;
             let mut pin_executor = Pin::new(Box::new(Executor {
-                priority_inner: priority_inner,
+                task_collection: task_collection,
                 stack_base: stack_base,
                 context: ExecuterContext::default(),
                 trapfrmae: TrapFrame::default(),
@@ -64,7 +64,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
             // 会loadtrapframe恢复trap前的context. 对于新创建的executor,
             // 需要手动在栈上保存trapframe(主要是sepc和sstatus寄存器),
             // 并将sp寄存器设置为改地址.
-            pin_executor.context.sp = Self::generate_stack(executer_addr, stack_top);
+            pin_executor.context.sp = Self::generate_stack(executer_addr, stack_top, cpu_id);
 
             // 将executor的入口地址设置为trap_return, 它会帮助我们sret到
             // executor_entry.S::executor_entry中执行
@@ -80,64 +80,44 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
     }
 
     pub fn run(&mut self) {
-        log::info!("new executor run, addr={:x}", self as *const _ as usize);
+        log::warn!("new executor run, addr={:x}", self as *const _ as usize);
         loop {
             let mut found = false;
-            for priority in 0..16 {
-                let mut inner = self.priority_inner.get_mut_inner(priority);
-                for page_idx in 0..inner.pages.len() {
-                    let (notified, _dropped) = {
-                        let page = &mut inner.pages[page_idx];
-                        (page.take_notified(), page.take_dropped())
-                    };
-                    log::trace!("notified={}", notified);
-                    if notified != 0 {
-                        found = true;
-                        for subpage_idx in BitIter::from(notified) {
-                            // task的idx
-                            let idx = page_idx * WAKER_PAGE_SIZE + subpage_idx;
-                            let waker = unsafe {
-                                Waker::from_raw((&inner.pages[page_idx]).raw_waker(subpage_idx))
-                            };
-                            let mut cx = Context::from_waker(&waker);
-                            let pinned_ref = inner.slab.get_pin_mut(idx).unwrap();
-                            let pinned_ptr =
-                                unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut _ };
-                            let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
-                            drop(inner); // 本次运行的coroutine可能会用到GLOBAL_EXCUTOR.inner(e.g. spawn())
+            if let Some((key, pinned_ref, waker)) =
+                unsafe { Arc::get_mut_unchecked(&mut self.task_collection).take_task() }
+            {
+                let mut cx = Context::from_waker(&waker);
+                let pinned_ptr = unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut F };
+                let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
+                unsafe {
+                    sstatus::set_sie();
+                } // poll future时允许中断
+                self.is_running_future = true;
 
-                            unsafe {
-                                sstatus::set_sie();
-                            } // poll future时允许中断
-                            self.is_running_future = true;
+                log::warn!("polling future");
+                let ret = { Future::poll(pinned_ref, &mut cx) };
+                log::warn!("polling future over");
+                unsafe {
+                    sstatus::clear_sie();
+                } // 禁用中断
+                self.is_running_future = false;
 
-                            log::trace!("polling future");
-                            let ret = { Future::poll(pinned_ref, &mut cx) };
-                            log::trace!("polling future over");
-                            unsafe {
-                                sstatus::clear_sie();
-                            } // 禁用中断
-                            self.is_running_future = false;
-
-                            if let ExecutorState::WEAK = self.state {
-                                log::info!("weak executor finish poll future, need killed");
-                                self.state = ExecutorState::KILLED;
-                                return;
-                            }
-
-                            inner = self.priority_inner.get_mut_inner(priority);
-                            match ret {
-                                Poll::Ready(()) => inner.pages[page_idx].mark_dropped(subpage_idx),
-                                Poll::Pending => (),
-                            }
-                        }
-                    }
+                if let ExecutorState::WEAK = self.state {
+                    log::info!("weak executor finish poll future, need killed");
+                    self.state = ExecutorState::KILLED;
+                    return;
                 }
-            }
-            if !found {
-                log::trace!("yield");
+
+                match ret {
+                    Poll::Ready(()) => {
+                        self.task_collection.remove_task(key);
+                    }
+                    Poll::Pending => (),
+                }
+            } else {
+                // log::trace!("no future to run, need yield");
                 crate::runtime::yeild();
-                log::trace!("yield over");
+                // log::trace!("yield over");
                 // unsafe {
                 //     crate::wait_for_interrupt();
                 // }
@@ -147,7 +127,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
 
     // stack layout: [executor_addr|32个寄存器|sstatus|sepc]
     // 发生中断时trapframe保存在栈中
-    pub fn generate_stack(executor_addr: usize, stack_top: usize) -> usize {
+    pub fn generate_stack(executor_addr: usize, stack_top: usize, cpu_id: u8) -> usize {
         // 将executor的地址放置在栈底, 以便于新的executor执行线程获取到
         // executor实例。
         let mut stack_top = stack_top;
@@ -160,6 +140,7 @@ impl<F: Future<Output = ()> + Unpin> Executor<F> {
         stack_top -= core::mem::size_of::<TrapFrame>();
         unsafe {
             (*(stack_top as *mut TrapFrame)).general.sp = executor_stack;
+            (*(stack_top as *mut TrapFrame)).general.tp = cpu_id as usize;
             (*(stack_top as *mut TrapFrame)).sstatus = 1usize << 8; // 设置spp为supervisor
             (*(stack_top as *mut TrapFrame)).sepc = executor_entry as *const () as usize;
         }

@@ -1,8 +1,8 @@
 extern crate alloc;
-use core::task::{RawWaker, RawWakerVTable};
 use alloc::alloc::{Allocator, Global, Layout};
 use core::mem;
 use core::ptr;
+use core::task::{RawWaker, RawWakerVTable};
 use {
     core::ops::Deref,
     core::ptr::NonNull,
@@ -154,6 +154,15 @@ impl WakerPage {
 
     pub fn take_dropped(&self) -> u64 {
         self.dropped.swap(0)
+    }
+
+    
+    pub fn clear(&self, ix: usize) {
+        debug_assert!(ix < 64);
+        let mask = !(1 << ix);
+        self.notified.fetch_and(mask);
+        self.completed.fetch_and(mask);
+        self.dropped.fetch_and(mask);
     }
 }
 
