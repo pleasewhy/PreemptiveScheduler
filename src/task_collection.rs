@@ -136,8 +136,8 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
         let subpage_ix = key % WAKER_PAGE_SIZE;
         let page_ix = (key << 5) >> 11;
         let priority = key >> 58;
-        log::warn!("key= 0x{:x}", key);
-        log::warn!("priority={}", priority);
+        log::trace!("key= 0x{:x}", key);
+        log::trace!("priority={}", priority);
         let ptr = self.inners[priority as usize].as_ptr();
         unsafe { (priority, &((*ptr).pages[page_ix]), subpage_ix) }
     }
@@ -151,6 +151,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
         assert!(priority < MAX_PRIORITY);
         let key = self.inners[priority].borrow_mut().insert(future);
         assert!(key < TASK_NUM_PER_PRIORITY);
+        self.task_num.fetch_add(1, Ordering::Relaxed);
         key + ((priority as u64) * TASK_NUM_PER_PRIORITY)
     }
 
@@ -159,11 +160,12 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
     }
 
     pub fn remove_task(&self, key: u64) {
-        log::warn!("remove task key = 0x{:x}", key);
+        log::trace!("remove task key = 0x{:x}", key);
         let (priority, page, offset) = self.parse_key(key as u64);
         let mut inner = self.get_mut_inner(priority);
         page.mark_dropped(offset);
         inner.slab.remove((key % TASK_NUM_PER_PRIORITY) as usize);
+        self.task_num.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn task_num(&self) -> usize {
@@ -212,6 +214,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
                                     unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut F };
                                 let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
                                 drop(inner);
+                                log::trace!("yield coroutine");
                                 yield Some((key as u64, pinned_ref, waker));
                                 inner = self.get_mut_inner(priority);
                             }

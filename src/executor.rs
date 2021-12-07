@@ -70,7 +70,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
             // executor_entry.S::executor_entry中执行
             pin_executor.context.ra = crate::trap_return as *const () as usize;
 
-            log::warn!(
+            log::trace!(
                 "stack top 0x{:x} executor addr 0x{:x}",
                 pin_executor.context.sp,
                 executer_addr
@@ -80,7 +80,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
     }
 
     pub fn run(&mut self) {
-        log::warn!("new executor run, addr={:x}", self as *const _ as usize);
+        log::trace!("new executor run, addr={:x}", self as *const _ as usize);
         loop {
             let mut found = false;
             if let Some((key, pinned_ref, waker)) =
@@ -94,9 +94,9 @@ impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
                 } // poll future时允许中断
                 self.is_running_future = true;
 
-                log::warn!("polling future");
+                log::trace!("polling future");
                 let ret = { Future::poll(pinned_ref, &mut cx) };
-                log::warn!("polling future over");
+                log::trace!("polling future over");
                 unsafe {
                     sstatus::clear_sie();
                 } // 禁用中断

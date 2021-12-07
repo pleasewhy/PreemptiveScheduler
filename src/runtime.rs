@@ -7,6 +7,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use lazy_static::*;
+use riscv::asm;
+use riscv::register::sstatus;
 use spin::{Mutex, MutexGuard};
 use {alloc::boxed::Box, core::future::Future, core::pin::Pin};
 
@@ -93,7 +95,7 @@ lazy_static! {
 
 // per-cpu scheduler.
 pub fn run() {
-    log::warn!("GLOBAL_RUNTIME.run()");
+    log::trace!("GLOBAL_RUNTIME.run()");
     loop {
         let mut runtime = get_current_runtime();
         let cx_ref = &runtime.context;
@@ -103,14 +105,14 @@ pub fn run() {
         runtime.current_executor = Some(runtime.strong_executor.clone());
         drop(runtime);
         unsafe {
-            // log::warn!("run strong executor");
+            log::trace!("run strong executor");
             crate::switch(runtime_cx, executor_cx);
             // 该函数返回说明当前strong_executor执行的future超时了,
             // 需要重新创建一个executor执行后续的future, 并且将
             // 新的executor作为strong_executor，旧的executor添
             // 加到weak_exector中。
         }
-        // log::warn!("switch return");
+        log::trace!("switch return");
         let mut runtime = get_current_runtime();
 
         // 只有strong_executor主动yield时, 才会执行运行weak_executor;
@@ -124,7 +126,6 @@ pub fn run() {
         let weak_executor_num = runtime.weak_executor_vec.len();
         if 0 == weak_executor_num {
             drop(runtime);
-            // log::warn!("wair for interrupt");
             unsafe {
                 crate::wait_for_interrupt();
             }
@@ -146,29 +147,29 @@ pub fn run() {
             drop(runtime);
             unsafe {
                 // sstatus::set_sie();
-                log::warn!("switch weak executor");
+                log::trace!("switch weak executor");
                 switch(runtime_cx, executor_ctx);
-                log::warn!("switch weak executor return");
+                log::trace!("switch weak executor return");
                 // sstatus::clear_sie();
             }
-            log::warn!("global locking");
+            log::trace!("global locking");
             runtime = get_current_runtime();
-            log::warn!("global locking finish");
+            log::trace!("global locking finish");
         }
-        log::warn!("run weak executor finish");
+        log::trace!("run weak executor finish");
     }
 }
 
 pub fn spawn(future: impl Future<Output = ()> + Send + 'static) {
-    log::warn!("spawn coroutine");
+    log::trace!("spawn coroutine");
     priority_spawn(future, DEFAULT_PRIORITY);
-    log::warn!("spawn coroutine over");
+    log::trace!("spawn coroutine over");
 }
 
-/// spawn a coroutine with `priority`.`
-/// insert new coroutine to the cpu with thie fewest number of tasks.
+/// spawn a coroutine with `priority`.
+/// insert new coroutine to the cpu with fewest number of tasks.
 pub fn priority_spawn(future: impl Future<Output = ()> + Send + 'static, priority: usize) {
-    log::warn!("in priority_spawn");
+    log::trace!("in priority_spawn");
     let bf: Pin<alloc::boxed::Box<dyn Future<Output = ()> + Send + 'static>> = Box::pin(future);
     let future = Mutex::from(bf);
     let state = Mutex::from(TaskState::RUNNABLE);
@@ -178,24 +179,27 @@ pub fn priority_spawn(future: impl Future<Output = ()> + Send + 'static, priorit
         _priority: priority as u8,
     };
 
-    // let mut fewest_task_cpu_id = 0;
-    // let mut fewest_task_num = GLOBAL_RUNTIME[0].lock().task_num();
-    // for runtime_idx in 1..GLOBAL_RUNTIME.len() {
-    //     let runtime = GLOBAL_RUNTIME[runtime_idx].lock();
-    //     let task_num = runtime.task_num();
-    //     if task_num < fewest_task_num {
-    //         fewest_task_cpu_id = runtime_idx;
-    //         fewest_task_num = task_num;
-    //     }
-    // }
-    get_current_runtime().add_task(priority, task);
+    let mut fewest_task_cpu_id = 0;
+    let mut fewest_task_num = GLOBAL_RUNTIME[0].lock().task_num();
+    for runtime_idx in 1..GLOBAL_RUNTIME.len() {
+        let runtime = GLOBAL_RUNTIME[runtime_idx].lock();
+        let task_num = runtime.task_num();
+        if task_num < fewest_task_num {
+            fewest_task_cpu_id = runtime_idx;
+            fewest_task_num = task_num;
+        }
+    }
+    log::trace!("fewest_task_cpu_id:{}", fewest_task_cpu_id);
+    GLOBAL_RUNTIME[fewest_task_cpu_id]
+        .lock()
+        .add_task(priority, task);
 }
 
 /// check whether the running coroutine of current cpu time out, if yes, we will
 /// switch to currrent cpu runtime that would create a new executor to run other
 /// coroutines.
 pub fn handle_timeout() {
-    log::warn!("handle timeout");
+    log::trace!("handle timeout");
     let runtime = get_current_runtime();
     if !runtime
         .current_executor
@@ -210,10 +214,11 @@ pub fn handle_timeout() {
     log::trace!("handle timeout return");
 }
 
+
 // 运行executor.run()
 #[no_mangle]
 pub(crate) fn run_executor(executor_addr: usize) {
-    log::warn!("run new executor: executor addr 0x{:x}", executor_addr);
+    log::trace!("run new executor: executor addr 0x{:x}", executor_addr);
     unsafe {
         let mut p = Box::from_raw(executor_addr as *mut Executor<Task>);
         p.run();
@@ -228,6 +233,7 @@ pub(crate) fn run_executor(executor_addr: usize) {
     }
 }
 
+/// switch to runtime, which would select an appropriate executor to run.
 pub(crate) fn yeild() {
     let runtime = get_current_runtime();
     let cx_ref = &runtime.context;
