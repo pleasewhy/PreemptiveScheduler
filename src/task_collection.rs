@@ -143,11 +143,11 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
     }
 
     // 插入一个Future, 其优先级为 DEFAULT_PRIORITY
-    pub fn insert(&self, future: F) -> u64 {
-        self.priority_insert(DEFAULT_PRIORITY, future)
+    pub fn add_task(&self, future: F) -> u64 {
+        self.priority_add_task(DEFAULT_PRIORITY, future)
     }
 
-    pub fn priority_insert(&self, priority: usize, future: F) -> u64 {
+    pub fn priority_add_task(&self, priority: usize, future: F) -> u64 {
         assert!(priority < MAX_PRIORITY);
         let key = self.inners[priority].borrow_mut().insert(future);
         assert!(key < TASK_NUM_PER_PRIORITY);

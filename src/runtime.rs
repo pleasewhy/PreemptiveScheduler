@@ -68,7 +68,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> ExecutorRuntime<F> {
     // 添加一个task，它的初始状态是notified，也就是说它可以被执行.
     fn add_task(&self, priority: usize, future: F) -> u64 {
         assert!(priority < MAX_PRIORITY);
-        let key = self.task_collection.priority_insert(priority, future);
+        let key = self.task_collection.priority_add_task(priority, future);
         key
     }
 
