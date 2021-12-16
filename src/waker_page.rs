@@ -90,7 +90,7 @@ pub struct WakerPage {
     notified: WakerU64,
     completed: WakerU64,
     dropped: WakerU64,
-    // waker: SharedWaker,
+    borrowed: WakerU64,
     _unused: [u8; 24],
 }
 
@@ -106,7 +106,7 @@ impl WakerPage {
             ptr::write(&mut page.notified as *mut _, WakerU64::new(0));
             ptr::write(&mut page.completed as *mut _, WakerU64::new(0));
             ptr::write(&mut page.dropped as *mut _, WakerU64::new(0));
-            // ptr::write(&mut page.waker as *mut _, waker);
+            ptr::write(&mut page.borrowed as *mut _, WakerU64::new(0));
         }
         WakerPageRef(ptr)
     }
@@ -121,18 +121,11 @@ impl WakerPage {
     pub fn mark_dropped(&self, ix: usize) {
         debug_assert!(ix < 64);
         self.dropped.fetch_or(1 << ix);
-        // self.waker.wake();
     }
 
     pub fn notify(&self, offset: usize) {
         debug_assert!(offset < 64);
-        // println!(
-        //     "in notify: notified={:b} offset={}",
-        //     self.notified.load(),
-        //     offset
-        // );
         self.notified.fetch_or(1 << offset);
-        // self.waker.wake();
     }
 
     /// Return a bit vector representing the futures in this page which are ready to be
@@ -141,14 +134,9 @@ impl WakerPage {
         // Unset all ready bits, since spurious notifications for completed futures would lead
         // us to poll them after completion.
         let mut notified = self.notified.swap(0);
-        // println!(
-        //     "take_notified: addr={}, after notified={} before notified={}",
-        //     &self as *const _ as usize,
-        //     self.notified.load(),
-        //     notified,
-        // );
         notified &= !self.completed.load();
         notified &= !self.dropped.load();
+        notified &= !self.borrowed.load();
         notified
     }
 
@@ -156,7 +144,6 @@ impl WakerPage {
         self.dropped.swap(0)
     }
 
-    
     pub fn clear(&self, ix: usize) {
         debug_assert!(ix < 64);
         let mask = !(1 << ix);
