@@ -3,36 +3,38 @@ use crate::context::Context as ExecutorContext;
 use crate::executor::Executor;
 use crate::switch;
 use crate::task_collection::{Task, TaskCollection, TaskState, DEFAULT_PRIORITY, MAX_PRIORITY};
+use crate::waker_page::WakerPageRef;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::task::Waker;
 use lazy_static::*;
 use riscv::asm;
 use riscv::register::sstatus;
 use spin::{Mutex, MutexGuard};
 use {alloc::boxed::Box, core::future::Future, core::pin::Pin};
 
-pub struct ExecutorRuntime<F: Future<Output = ()> + Unpin + 'static> {
+pub struct ExecutorRuntime {
     // runtime only run on this cpu
     cpu_id: u8,
 
     // 只会在一个core上运行，不需要考虑同步问题
-    task_collection: Arc<TaskCollection<F>>,
+    task_collection: Arc<TaskCollection<Task>>,
 
     // 通过force_switch_future会将strong_executor降级为weak_executor
-    strong_executor: Arc<Pin<Box<Executor<F>>>>,
+    strong_executor: Arc<Pin<Box<Executor>>>,
 
     // 该executor在执行完一次后就会被drop
-    weak_executor_vec: Vec<Option<Arc<Pin<Box<Executor<F>>>>>>,
+    weak_executor_vec: Vec<Option<Arc<Pin<Box<Executor>>>>>,
 
     // 当前正在执行的executor
-    current_executor: Option<Arc<Pin<Box<Executor<F>>>>>,
+    current_executor: Option<Arc<Pin<Box<Executor>>>>,
 
     // runtime context
     context: ExecutorContext,
 }
 
-impl<F: Future<Output = ()> + Unpin + 'static> ExecutorRuntime<F> {
+impl ExecutorRuntime {
     pub fn new(cpu_id: u8) -> Self {
         let task_collection = TaskCollection::new();
         let task_collection_cloned = task_collection.clone();
@@ -47,7 +49,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> ExecutorRuntime<F> {
         e
     }
 
-    fn add_weak_executor(&mut self, weak_executor: Arc<Pin<Box<Executor<F>>>>) {
+    fn add_weak_executor(&mut self, weak_executor: Arc<Pin<Box<Executor>>>) {
         self.weak_executor_vec.push(Some(weak_executor));
     }
 
@@ -66,7 +68,7 @@ impl<F: Future<Output = ()> + Unpin + 'static> ExecutorRuntime<F> {
     }
 
     // 添加一个task，它的初始状态是notified，也就是说它可以被执行.
-    fn add_task(&self, priority: usize, future: F) -> u64 {
+    fn add_task(&self, priority: usize, future: Task) -> u64 {
         assert!(priority < MAX_PRIORITY);
         let key = self.task_collection.priority_add_task(priority, future);
         key
@@ -77,20 +79,41 @@ impl<F: Future<Output = ()> + Unpin + 'static> ExecutorRuntime<F> {
     }
 }
 
-impl<F: Future<Output = ()> + Unpin> Drop for ExecutorRuntime<F> {
+impl Drop for ExecutorRuntime {
     fn drop(&mut self) {
-        log::error!("drop executor runtime!!!!");
+        panic!("drop executor runtime!!!!");
     }
 }
 
-unsafe impl Send for ExecutorRuntime<Task> {}
-unsafe impl Sync for ExecutorRuntime<Task> {}
+unsafe impl Send for ExecutorRuntime {}
+unsafe impl Sync for ExecutorRuntime {}
 
 lazy_static! {
-    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime<Task>>; 2] = [
+    pub static ref GLOBAL_RUNTIME: [Mutex<ExecutorRuntime>; 2] = [
         Mutex::new(ExecutorRuntime::new(0)),
         Mutex::new(ExecutorRuntime::new(1))
     ];
+}
+
+static num: usize = 0;
+// obtain a task from other cpu.
+pub(crate) fn take_task_from_other_cpu(
+) -> Option<(u64, WakerPageRef, Pin<&'static mut Task>, Waker)> {
+    let mut max_task_cpu_id = 0;
+    let mut max_task_num = GLOBAL_RUNTIME[0].lock().task_num();
+    for runtime_idx in 1..GLOBAL_RUNTIME.len() {
+        let runtime = GLOBAL_RUNTIME[runtime_idx].lock();
+        let task_num = runtime.task_num();
+        if task_num > max_task_num {
+            max_task_cpu_id = runtime_idx;
+            max_task_num = task_num;
+        }
+    }
+    log::trace!("fewest_task_cpu_id:{}", max_task_cpu_id);
+    unsafe {
+        Arc::get_mut_unchecked(&mut GLOBAL_RUNTIME[max_task_cpu_id].lock().task_collection)
+            .take_task()
+    }
 }
 
 // per-cpu scheduler.
@@ -189,6 +212,7 @@ pub fn priority_spawn(future: impl Future<Output = ()> + Send + 'static, priorit
             fewest_task_num = task_num;
         }
     }
+    fewest_task_cpu_id = 0;
     log::trace!("fewest_task_cpu_id:{}", fewest_task_cpu_id);
     GLOBAL_RUNTIME[fewest_task_cpu_id]
         .lock()
@@ -214,13 +238,12 @@ pub fn handle_timeout() {
     log::trace!("handle timeout return");
 }
 
-
 // 运行executor.run()
 #[no_mangle]
 pub(crate) fn run_executor(executor_addr: usize) {
     log::trace!("run new executor: executor addr 0x{:x}", executor_addr);
     unsafe {
-        let mut p = Box::from_raw(executor_addr as *mut Executor<Task>);
+        let mut p = Box::from_raw(executor_addr as *mut Executor);
         p.run();
 
         let runtime = get_current_runtime();
@@ -245,6 +268,6 @@ pub(crate) fn yeild() {
 }
 
 /// return runtime `MutexGuard` of current cpu.
-pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime<Task>> {
+pub(crate) fn get_current_runtime() -> MutexGuard<'static, ExecutorRuntime> {
     GLOBAL_RUNTIME[crate::cpu_id() as usize].lock()
 }

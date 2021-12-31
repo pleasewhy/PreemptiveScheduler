@@ -100,8 +100,16 @@ pub const MAX_PRIORITY: usize = 32;
 pub struct TaskCollection<F: Future<Output = ()> + Unpin + 'static> {
     inners: Vec<RefCell<Inner<F>>>,
     task_num: AtomicUsize,
-    generator:
-        Option<Box<dyn Generator<Yield = Option<(u64, Pin<&'static mut F>, Waker)>, Return = ()>>>,
+    generator: Option<
+        Mutex<
+            Box<
+                dyn Generator<
+                    Yield = Option<(u64, WakerPageRef, Pin<&'static mut F>, Waker)>,
+                    Return = (),
+                >,
+            >,
+        >,
+    >,
 }
 
 impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
@@ -121,8 +129,9 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
                 .push(RefCell::new(inner));
         }
 
-        unsafe { Arc::get_mut_unchecked(&mut task_collection) }.generator =
-            Some(Box::new(TaskCollection::generator(task_collection.clone())));
+        unsafe { Arc::get_mut_unchecked(&mut task_collection) }.generator = Some(Mutex::new(
+            Box::new(TaskCollection::generator(task_collection.clone())),
+        ));
         return task_collection;
     }
 
@@ -142,9 +151,19 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
         unsafe { (priority, &((*ptr).pages[page_ix]), subpage_ix) }
     }
 
-    // 插入一个Future, 其优先级为 DEFAULT_PRIORITY
+    /// 插入一个Future, 其优先级为 DEFAULT_PRIORITY
     pub fn add_task(&self, future: F) -> u64 {
         self.priority_add_task(DEFAULT_PRIORITY, future)
+    }
+
+    /// remove the task correponding to the key.
+    pub fn remove_task(&self, key: u64) {
+        log::trace!("remove task key = 0x{:x}", key);
+        let (priority, page, offset) = self.parse_key(key as u64);
+        let mut inner = self.get_mut_inner(priority);
+        page.mark_dropped(offset);
+        inner.slab.remove((key % TASK_NUM_PER_PRIORITY) as usize);
+        self.task_num.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn priority_add_task(&self, priority: usize, future: F) -> u64 {
@@ -159,22 +178,13 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
         return self.inners[priority].try_borrow_mut().unwrap();
     }
 
-    pub fn remove_task(&self, key: u64) {
-        log::trace!("remove task key = 0x{:x}", key);
-        let (priority, page, offset) = self.parse_key(key as u64);
-        let mut inner = self.get_mut_inner(priority);
-        page.mark_dropped(offset);
-        inner.slab.remove((key % TASK_NUM_PER_PRIORITY) as usize);
-        self.task_num.fetch_sub(1, Ordering::Relaxed);
-    }
-
     pub fn task_num(&self) -> usize {
         return self.task_num.load(Ordering::Relaxed);
     }
 
-    pub fn take_task(&mut self) -> Option<(u64, Pin<&'static mut F>, Waker)> {
+    pub fn take_task(&mut self) -> Option<(u64, WakerPageRef, Pin<&'static mut F>, Waker)> {
         unsafe {
-            match Pin::new_unchecked(self.generator.as_mut().unwrap().as_mut()).resume(()) {
+            match Pin::new_unchecked(self.generator.as_ref().unwrap().lock().as_mut()).resume(()) {
                 GeneratorState::Yielded(ret) => ret,
                 _ => panic!("unexpected value from resume"),
             }
@@ -183,15 +193,18 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
 
     pub fn generator(
         self: Arc<Self>,
-    ) -> impl Generator<Yield = Option<(u64, Pin<&'static mut F>, Waker)>, Return = ()> {
+    ) -> impl Generator<Yield = Option<(u64, WakerPageRef, Pin<&'static mut F>, Waker)>, Return = ()>
+    {
         static move || {
             loop {
                 let mut found = false;
                 for priority in 0..16 {
+                    // log::warn!("get mut inner: generator1 start");
                     let mut inner = self.get_mut_inner(priority);
+                    // log::warn!("get mut inner: generator1 end");
                     let pages_len = inner.pages.len();
                     for page_idx in 0..pages_len {
-                        let (notified, _dropped) = {
+                        let (notified, dropped) = {
                             let page = &mut inner.pages[page_idx];
                             (page.take_notified(), page.take_dropped())
                         };
@@ -213,10 +226,26 @@ impl<F: Future<Output = ()> + Unpin + 'static> TaskCollection<F> {
                                 let pinned_ptr =
                                     unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut F };
                                 let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
+                                let page_ref = inner.pages[page_idx].clone();
                                 drop(inner);
                                 log::trace!("yield coroutine");
-                                yield Some((key as u64, pinned_ref, waker));
+                                yield Some((key as u64, page_ref, pinned_ref, waker));
+                                log::warn!("get mut inner: generator2 start");
                                 inner = self.get_mut_inner(priority);
+                                log::warn!("get mut inner: generator2 end");
+                            }
+                        }
+                        if dropped != 0 {
+                            for subpage_idx in BitIter::from(dropped) {
+                                // the key corresponding to the task
+                                let key = priority * (TASK_NUM_PER_PRIORITY as usize)
+                                    + page_idx * WAKER_PAGE_SIZE
+                                    + subpage_idx;
+                                inner
+                                    .slab
+                                    .remove((key % (TASK_NUM_PER_PRIORITY as usize)) as usize);
+                                self.task_num.fetch_sub(1, Ordering::Relaxed);
+                                inner.pages[page_idx].clear(subpage_idx);
                             }
                         }
                     }

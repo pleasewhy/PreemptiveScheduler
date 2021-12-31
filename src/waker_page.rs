@@ -91,7 +91,7 @@ pub struct WakerPage {
     completed: WakerU64,
     dropped: WakerU64,
     borrowed: WakerU64,
-    _unused: [u8; 24],
+    _unused: [u8; 16],
 }
 
 impl WakerPage {
@@ -121,6 +121,11 @@ impl WakerPage {
     pub fn mark_dropped(&self, ix: usize) {
         debug_assert!(ix < 64);
         self.dropped.fetch_or(1 << ix);
+    }
+
+    pub fn mark_complete(&self, ix: usize) {
+        debug_assert!(ix < 64);
+        self.completed.fetch_or(1 << ix);
     }
 
     pub fn notify(&self, offset: usize) {

@@ -1,9 +1,9 @@
 extern crate alloc;
 extern crate log;
 
-use crate::context::Context as ExecuterContext;
 use crate::task_collection::Task;
 use crate::waker_page::WAKER_PAGE_SIZE;
+use crate::{context::Context as ExecuterContext, waker_page::WakerPageRef};
 use alloc::alloc::{Allocator, Global, Layout};
 use bit_iter::BitIter;
 use core::matches;
@@ -29,8 +29,8 @@ enum ExecutorState {
     UNUSED,
 }
 
-pub struct Executor<F: Future<Output = ()> + Unpin + 'static> {
-    task_collection: Arc<TaskCollection<F>>,
+pub struct Executor {
+    task_collection: Arc<TaskCollection<Task>>,
     stack_base: usize,
     pub context: ExecuterContext,
     pub trapfrmae: TrapFrame,
@@ -38,9 +38,9 @@ pub struct Executor<F: Future<Output = ()> + Unpin + 'static> {
     state: ExecutorState,
 }
 
-const STACK_SIZE: usize = 4096 * 16;
-impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
-    pub fn new(task_collection: Arc<TaskCollection<F>>, cpu_id: u8) -> Pin<Box<Self>> {
+const STACK_SIZE: usize = 4096 * 32;
+impl Executor {
+    pub fn new(task_collection: Arc<TaskCollection<Task>>, cpu_id: u8) -> Pin<Box<Self>> {
         unsafe {
             let layout = Layout::new::<[u8; STACK_SIZE]>();
 
@@ -79,41 +79,56 @@ impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
         }
     }
 
+    fn run_task(
+        &mut self,
+        key: u64,
+        page_ref: WakerPageRef,
+        pinned_task_ref: Pin<&mut Task>,
+        waker: Waker,
+    ) {
+        let mut cx = Context::from_waker(&waker);
+        let pinned_ptr = unsafe { Pin::into_inner_unchecked(pinned_task_ref) as *mut Task };
+        let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
+        unsafe {
+            sstatus::set_sie();
+        } // poll future时允许中断
+        self.is_running_future = true;
+
+        log::trace!("polling future");
+        let ret = { Future::poll(pinned_ref, &mut cx) };
+        log::trace!("polling future over");
+        unsafe {
+            sstatus::clear_sie();
+        } // 禁用中断
+        self.is_running_future = false;
+
+        if let ExecutorState::WEAK = self.state {
+            log::info!("weak executor finish poll future, need killed");
+            self.state = ExecutorState::KILLED;
+            return;
+        }
+
+        match ret {
+            Poll::Ready(()) => {
+                // self.task_collection.remove_task(key);
+                page_ref.mark_dropped((key % (WAKER_PAGE_SIZE as u64)) as usize);
+            }
+            Poll::Pending => (),
+        }
+    }
+
     pub fn run(&mut self) {
         log::trace!("new executor run, addr={:x}", self as *const _ as usize);
         loop {
-            let mut found = false;
-            if let Some((key, pinned_ref, waker)) =
+            if let Some((key, page_ref, pinned_task_ref, waker)) =
                 unsafe { Arc::get_mut_unchecked(&mut self.task_collection).take_task() }
             {
-                let mut cx = Context::from_waker(&waker);
-                let pinned_ptr = unsafe { Pin::into_inner_unchecked(pinned_ref) as *mut F };
-                let pinned_ref = unsafe { Pin::new_unchecked(&mut *pinned_ptr) };
-                unsafe {
-                    sstatus::set_sie();
-                } // poll future时允许中断
-                self.is_running_future = true;
-
-                log::trace!("polling future");
-                let ret = { Future::poll(pinned_ref, &mut cx) };
-                log::trace!("polling future over");
-                unsafe {
-                    sstatus::clear_sie();
-                } // 禁用中断
-                self.is_running_future = false;
-
-                if let ExecutorState::WEAK = self.state {
-                    log::info!("weak executor finish poll future, need killed");
-                    self.state = ExecutorState::KILLED;
-                    return;
-                }
-
-                match ret {
-                    Poll::Ready(()) => {
-                        self.task_collection.remove_task(key);
-                    }
-                    Poll::Pending => (),
-                }
+                self.run_task(key, page_ref, pinned_task_ref, waker)
+            } else if let Some((key, page_ref, pinned_task_ref, waker)) =
+                crate::runtime::take_task_from_other_cpu()
+            {
+                log::trace!("task from other cpu");
+                self.run_task(key, page_ref, pinned_task_ref, waker)
             } else {
                 // log::trace!("no future to run, need yield");
                 crate::runtime::yeild();
@@ -162,5 +177,5 @@ impl<F: Future<Output = ()> + Unpin + 'static> Executor<F> {
         self.state = ExecutorState::WEAK;
     }
 }
-unsafe impl Send for Executor<Task> {}
-unsafe impl Sync for Executor<Task> {}
+unsafe impl Send for Executor {}
+unsafe impl Sync for Executor {}
